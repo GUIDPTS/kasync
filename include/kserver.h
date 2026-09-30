@@ -37,7 +37,9 @@ kev_result fn(KOPAQUE data, void *arg, int got) { \
 	assert(ss->st.base.selector == kgl_get_tls_selector());\
 	kconnection *cn = accept_result_new_connection(data,got);\
 	if (cn==NULL) {\
-		kserver_selectable_destroy(ss);\
+		if (!IS_VALIDE_CONNECTION(got) || !KBIT_TEST(ss->server->flags,KGL_SERVER_START) || !kserver_selectable_accept(ss, arg)) {\
+			kserver_selectable_destroy(ss);\
+		}\
 		return kev_ok;\
 	}\
 	selectable_bind(&cn->st, kserver_get_perfect_selector(ss));\
@@ -70,6 +72,9 @@ struct kserver_selectable_s{
 #endif
 	sockaddr_i accept_addr;
 	socklen_t addr_len;
+#ifndef KGL_IOCP
+	time_t accept_error_log_sec;
+#endif
 #ifdef _WIN32
 	char *tmp_addr_buf;
 	SOCKET accept_sockfd;

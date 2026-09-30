@@ -11,14 +11,17 @@
 kev_result kfiber_mutex_lock2(kfiber_mutex* mutex, KOPAQUE data, result_callback notice, void* arg)
 {
 	kassert(kfiber_self2() == NULL);
+	kfiber_waiter* waiter = NULL;
 	kmutex_lock(&mutex->lock);
+	mutex->count++;
 	if (mutex->worker < mutex->limit) {
 		mutex->worker++;
 		kmutex_unlock(&mutex->lock);
 		kgl_selector_module.next(kgl_get_tls_selector(), data, notice, arg, 0);
 		return kev_ok;
 	}
-	kfiber_add_ev_waiter(&mutex->waiter, kgl_get_tls_selector(), data, notice, arg);
+	kfiber_add_ev_waiter(&waiter, kgl_get_tls_selector(), data, notice, arg);
+	__kfiber_mutex_append_waiter(mutex, waiter);
 	kmutex_unlock(&mutex->lock);
 	return kev_ok;
 }

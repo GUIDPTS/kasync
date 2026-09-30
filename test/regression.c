@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include "kaddr.h"
@@ -8,6 +9,8 @@
 #include "kselectable.h"
 #include "ksocket.h"
 #include "ksync.h"
+#include "kfiber.h"
+#include "kfiber_sync.h"
 
 extern bool get_addr(const char *hostname, kgl_addr_type addr_type, struct addrinfo **res);
 
@@ -105,6 +108,100 @@ static void test_udp_without_pktinfo(void)
 	ksocket_close(receiver);
 }
 
+static kfiber_rwlock *test_rwlock;
+static kcond *test_rwlock_done;
+static volatile int test_rwlock_reader_done;
+
+static int rwlock_reader(void *arg, int len)
+{
+	kfiber_rwlock_rlock(test_rwlock);
+	kfiber_rwlock_runlock(test_rwlock);
+	test_rwlock_reader_done = 1;
+	return 0;
+}
+
+static int rwlock_writer(void *arg, int len)
+{
+	kfiber *reader = NULL;
+	kfiber_rwlock_wlock(test_rwlock);
+	kfiber_create(rwlock_reader, NULL, 0, 0, &reader);
+	kfiber_msleep(10);
+	/* the reader waits on the same selector, wunlock must not wake it with the internal mutex held. */
+	kfiber_rwlock_wunlock(test_rwlock);
+	kfiber_join(reader, NULL);
+	kcond_notice(test_rwlock_done);
+	return 0;
+}
+
+static void test_rwlock_wakeup_same_selector_reader(void)
+{
+	test_rwlock = kfiber_rwlock_init();
+	test_rwlock_done = kcond_init(true);
+	kfiber_create2(get_selector_by_index(0), rwlock_writer, NULL, 0, 0, NULL);
+	if (!kcond_try_wait(test_rwlock_done, 5000) || !test_rwlock_reader_done) {
+		fprintf(stderr, "kfiber_rwlock_wunlock deadlocked with a same-selector reader\n");
+		exit(1);
+	}
+	kcond_destroy(test_rwlock_done);
+	kfiber_rwlock_destroy(test_rwlock);
+}
+
+static kfiber_mutex *test_mutex;
+static kcond *test_mutex_done;
+static int test_mutex_order[4];
+static volatile int test_mutex_got;
+
+static int mutex_waiter(void *arg, int len)
+{
+	kfiber_mutex_lock(test_mutex);
+	test_mutex_order[test_mutex_got++] = len;
+	kfiber_mutex_unlock(test_mutex);
+	return 0;
+}
+
+static int mutex_holder(void *arg, int len)
+{
+	int fifo_ok, limit_ok;
+	kfiber_mutex_lock(test_mutex);
+	for (int i = 1; i <= 3; i++) {
+		kfiber_create(mutex_waiter, NULL, i, 0, NULL);
+	}
+	kfiber_msleep(10);
+	kfiber_mutex_unlock(test_mutex);
+	kfiber_msleep(10);
+	fifo_ok = (test_mutex_got == 3 && test_mutex_order[0] == 1 && test_mutex_order[1] == 2 && test_mutex_order[2] == 3);
+
+	test_mutex_got = 0;
+	kfiber_mutex_lock(test_mutex);
+	kfiber_create(mutex_waiter, NULL, 1, 0, NULL);
+	kfiber_create(mutex_waiter, NULL, 2, 0, NULL);
+	kfiber_msleep(10);
+	kfiber_mutex_set_limit(test_mutex, 3);
+	kfiber_msleep(10);
+	limit_ok = (test_mutex_got == 2);
+	kfiber_mutex_unlock(test_mutex);
+	if (fifo_ok && limit_ok) {
+		kcond_notice(test_mutex_done);
+	} else {
+		fprintf(stderr, "kfiber_mutex fifo_ok=%d limit_ok=%d order=%d,%d,%d\n", fifo_ok, limit_ok,
+			test_mutex_order[0], test_mutex_order[1], test_mutex_order[2]);
+	}
+	return 0;
+}
+
+static void test_mutex_fifo_and_limit(void)
+{
+	test_mutex = kfiber_mutex_init();
+	test_mutex_done = kcond_init(true);
+	kfiber_create2(get_selector_by_index(0), mutex_holder, NULL, 0, 0, NULL);
+	if (!kcond_try_wait(test_mutex_done, 5000)) {
+		fprintf(stderr, "kfiber_mutex waiters are not FIFO or set_limit does not wake waiters\n");
+		exit(1);
+	}
+	kcond_destroy(test_mutex_done);
+	kfiber_mutex_destroy(test_mutex);
+}
+
 static void test_selector_shutdown(void)
 {
 	kasync_init();
@@ -115,6 +212,8 @@ static void test_selector_shutdown(void)
 #else
 	usleep(100000);
 #endif
+	test_rwlock_wakeup_same_selector_reader();
+	test_mutex_fifo_and_limit();
 	selector_manager_close();
 	assert(!is_selector_manager_init());
 }

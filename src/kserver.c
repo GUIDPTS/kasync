@@ -21,26 +21,57 @@ typedef struct {
 #endif
 
 #ifndef KGL_IOCP
+#define KSERVER_ACCEPT_RETRY_MSEC 100
+static kev_result kserver_accept_retry(KOPAQUE data, void *arg, int got)
+{
+	kserver_selectable *ss = (kserver_selectable *)arg;
+	if (KBIT_TEST(ss->server->flags, KGL_SERVER_START) && !ss->st.base.selector->shutdown &&
+		kgl_selector_module.accept(ss, ss->st.e[OP_WRITE].arg)) {
+		return kev_ok;
+	}
+	/* shutdown may already have queued this selectable while the timer was pending. */
+	kselector_remove_list(ss->st.base.selector, &ss->st);
+	return ss->st.e[OP_WRITE].result(ss, ss->st.e[OP_WRITE].arg, -1);
+}
 kev_result kselector_event_accept(KOPAQUE data, void *arg,int got)
 {
 	kserver_selectable *ss = (kserver_selectable *)arg;
-	//printf("ksocket_accept called...\n");
-	SOCKET sockfd = ksocket_accept(ss->st.fd,&ss->accept_addr, true);
-	
-	if (sockfd>=0) {
-		//printf("ksocket_accept=[%d]\n",sockfd);
-		return ss->st.e[OP_WRITE].result(data, ss->st.e[OP_WRITE].arg,(int)sockfd);
+	SOCKET sockfd;
+	int err;
+	for (;;) {
+		sockfd = ksocket_accept(ss->st.fd, &ss->accept_addr, true);
+		if (sockfd >= 0) {
+			return ss->st.e[OP_WRITE].result(data, ss->st.e[OP_WRITE].arg, (int)sockfd);
+		}
+		err = errno;
+		if (KBIT_TEST(ss->st.base.st_flags, STF_ERR)) {
+			break;
+		}
+		/* the pending connection failed, the listen socket is still fine. */
+		if (err == EINTR || err == ECONNABORTED || err == EPROTO || err == EPERM) {
+			continue;
+		}
+		break;
 	}
-	if (errno==EAGAIN && !KBIT_TEST(ss->st.base.st_flags,STF_ERR)) {
-		//printf("try again\n");
-		assert(!KBIT_TEST(ss->st.base.st_flags, STF_RREADY2));
-		KBIT_CLR(ss->st.base.st_flags,STF_RREADY);
-		if (kgl_selector_module.accept(ss, ss->st.e[OP_WRITE].arg)) {
-			return kev_ok;
+	if (!KBIT_TEST(ss->st.base.st_flags, STF_ERR)) {
+		if (err == EAGAIN || err == EWOULDBLOCK) {
+			assert(!KBIT_TEST(ss->st.base.st_flags, STF_RREADY2));
+			KBIT_CLR(ss->st.base.st_flags, STF_RREADY);
+			if (kgl_selector_module.accept(ss, ss->st.e[OP_WRITE].arg)) {
+				return kev_ok;
+			}
+		} else if (err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM) {
+			/* keep STF_RREADY: backlog connections will not trigger a new edge event. */
+			if (ss->accept_error_log_sec != kgl_current_sec) {
+				ss->accept_error_log_sec = kgl_current_sec;
+				klog(KLOG_ERR, "accept failed errno=%d %s, retry after %dms\n", err, strerror(err), KSERVER_ACCEPT_RETRY_MSEC);
+			}
+			if (kselector_add_timer(ss->st.base.selector, kserver_accept_retry, ss, KSERVER_ACCEPT_RETRY_MSEC, data) == 0) {
+				return kev_ok;
+			}
 		}
 	}
-	//printf("accept failed.\n");
-	return ss->st.e[OP_WRITE].result(data, ss->st.e[OP_WRITE].arg,(int)sockfd);	
+	return ss->st.e[OP_WRITE].result(data, ss->st.e[OP_WRITE].arg, -1);
 }
 #endif
 
@@ -365,17 +396,19 @@ void kserver_release(kserver *server)
 
 void kserver_selectable_destroy(kserver_selectable *ss)
 {
-	if (ksocket_opened(ss->st.fd)) {
-		ksocket_close(ss->st.fd);
-		ksocket_init(ss->st.fd);
-	}
 	assert(ss->server);
+	/* unlink before close, kserver_close may shutdown the fd from another thread. */
 	kmutex_lock(&ss->server->ss_lock);
 	if (ss->queue.next) {
 		assert(!klist_empty(&ss->server->ss));
 		klist_remove(&ss->queue);
+		ss->queue.next = NULL;
 	}
 	kmutex_unlock(&ss->server->ss_lock);
+	if (ksocket_opened(ss->st.fd)) {
+		ksocket_close(ss->st.fd);
+		ksocket_init(ss->st.fd);
+	}
 #ifdef ACCEPT_SOCKET_SHUTDOWN_NO_EVENT
 	if(katom_get((void *)&ss->hold_by_next_shutdown_refs)>0) {
 		//hold by next_shutdown

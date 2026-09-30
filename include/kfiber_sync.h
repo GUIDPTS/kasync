@@ -17,6 +17,7 @@ struct _kfiber_cond_ts {
 
 struct _kfiber_mutex {
 	kfiber_waiter* waiter;
+	kfiber_waiter* waiter_last;
 	kmutex lock;
 	int count;// 总数
 	int worker;//获得锁数量
@@ -37,6 +38,16 @@ struct _kfiber_cond_sync
 	int got;
 };
 
+/* FIFO, request queue waiters must not be starved by newer waiters. */
+INLINE void __kfiber_mutex_append_waiter(kfiber_mutex* mutex, kfiber_waiter* waiter) {
+	waiter->next = NULL;
+	if (mutex->waiter == NULL) {
+		mutex->waiter = waiter;
+	} else {
+		mutex->waiter_last->next = waiter;
+	}
+	mutex->waiter_last = waiter;
+}
 INLINE int __kfiber_mutex_lock(kfiber* fiber, kfiber_mutex* mutex, int max) {
 	kmutex_lock(&mutex->lock);
 	if (max > 0 && mutex->count >= max) {
@@ -49,7 +60,8 @@ INLINE int __kfiber_mutex_lock(kfiber* fiber, kfiber_mutex* mutex, int max) {
 		kmutex_unlock(&mutex->lock);
 		return 0;
 	}
-	kfiber_add_waiter(&mutex->waiter, fiber, mutex);// kgl_get_tls_selector(), mutex, result_switch_fiber, fiber);
+	fiber->base.wait_obj = mutex;
+	__kfiber_mutex_append_waiter(mutex, &fiber->base);
 	kmutex_unlock(&mutex->lock);
 	__kfiber_wait(fiber, mutex);
 	return 0;
@@ -74,9 +86,27 @@ INLINE void kfiber_mutex_set_limit(kfiber_mutex* mutex, int limit) {
 	if (limit < 1) {
 		limit = 1;
 	}
+	kfiber_waiter* wakeup = NULL;
+	kfiber_waiter* wakeup_last = NULL;
 	kmutex_lock(&mutex->lock);
 	mutex->limit = limit;
+	while (mutex->waiter && mutex->worker < mutex->limit) {
+		kfiber_waiter* waiter = mutex->waiter;
+		mutex->waiter = waiter->next;
+		mutex->worker++;
+		waiter->next = NULL;
+		if (wakeup_last) {
+			wakeup_last->next = waiter;
+		} else {
+			wakeup = waiter;
+		}
+		wakeup_last = waiter;
+	}
+	if (mutex->waiter == NULL) {
+		mutex->waiter_last = NULL;
+	}
 	kmutex_unlock(&mutex->lock);
+	kfiber_wakeup_all_waiter(wakeup, 0);
 }
 INLINE int kfiber_mutex_get_worker(kfiber_mutex* mutex) {
 	int worker;
@@ -110,13 +140,16 @@ INLINE int kfiber_mutex_unlock(kfiber_mutex* mutex) {
 	assert(mutex->count > 0);
 	mutex->count--;
 	kfiber_waiter* waiter = mutex->waiter;
-	if (waiter == NULL) {
+	if (waiter == NULL || mutex->worker > mutex->limit) {
 		assert(mutex->worker > 0);
 		mutex->worker--;
 		kmutex_unlock(&mutex->lock);
 		return 0;
 	}
 	mutex->waiter = waiter->next;
+	if (mutex->waiter == NULL) {
+		mutex->waiter_last = NULL;
+	}
 	kmutex_unlock(&mutex->lock);
 	kfiber_wakeup_waiter(waiter, 0);
 	return 0;
@@ -195,13 +228,12 @@ INLINE int kfiber_rwlock_wunlock(kfiber_rwlock* mutex) {
 	if (mutex->reader) {
 		kfiber_waiter* waiter = mutex->reader;
 		mutex->reader = NULL;
-		while (waiter) {
+		for (kfiber_waiter* pos = waiter; pos; pos = pos->next) {
 			mutex->cnt++;
-			kfiber_waiter* next = waiter->next;
-			kfiber_wakeup_waiter(waiter, 0);
-			waiter = next;
 		}
+		/* same selector wakeup switches to the reader at once, it may call runlock. */
 		kmutex_unlock(&mutex->lock);
+		kfiber_wakeup_all_waiter(waiter, 0);
 		return 0;
 	}
 	return __kfiber_rwlock_try_wakeup_writer(mutex);
