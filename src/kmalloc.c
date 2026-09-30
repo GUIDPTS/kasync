@@ -349,15 +349,26 @@ void* kgl_array_push_n(kgl_array_t* a, size_t n) {
 
 	return elt;
 }
+#ifdef _WIN32
+static void kgl_pool_align_free(void* p) {
+	kgl_align_free(p);
+}
+#endif
 void* kgl_pmemalign(kgl_pool_t* pool, size_t size, size_t alignment) {
 	void* p;
-	kgl_pool_large_t* large;
 
 	p = kgl_memalign(alignment, size);
 	if (p == NULL) {
 		return NULL;
 	}
-	large = (kgl_pool_large_t*)kgl_palloc_small(pool, sizeof(kgl_pool_large_t), 1);
+#ifdef _WIN32
+	/* large blocks are released with free(), which must not be used on _aligned_malloc memory. */
+	if (kgl_cleanup_add(pool, kgl_pool_align_free, p) == NULL) {
+		kgl_align_free(p);
+		return NULL;
+	}
+#else
+	kgl_pool_large_t* large = (kgl_pool_large_t*)kgl_palloc_small(pool, sizeof(kgl_pool_large_t), 1);
 	if (large == NULL) {
 		kgl_align_free(p);
 		return NULL;
@@ -366,6 +377,6 @@ void* kgl_pmemalign(kgl_pool_t* pool, size_t size, size_t alignment) {
 	large->alloc = p;
 	large->next = pool->large;
 	pool->large = large;
-
+#endif
 	return p;
 }
