@@ -410,6 +410,8 @@ SSL_CTX* kgl_ssl_ctx_new(void* ssl_ctx_data) {
 	//disable SSLV2
 	SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
 	SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
+	kgl_ssl_ctx_set_protocols(ctx, NULL);
+	SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES:!DES:!DSS");
 	//kgl_ssl_dhparam(ssl_ctx);
 	kgl_ssl_ecdh_curve(ctx, "auto");
 	SSL_CTX_set_ex_data(ctx, kangle_ssl_ctx_index, ssl_ctx_data);
@@ -867,7 +869,8 @@ void kgl_ssl_ctx_set_protocols(SSL_CTX* ctx, const char* protocols) {
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
 #endif
 	if (protocols == NULL || *protocols == '\0') {
-		return;
+		/* Explicit protocol lists still permit legacy interoperability. */
+		protocols = "TLSv1.2 TLSv1.3";
 	}
 	char* buf = strdup(protocols);
 	char* hot = buf;
