@@ -298,7 +298,8 @@ static bool kgl_ssl_client_set_hostname(SSL *ssl, const char *hostname)
 			/* RFC 6066: SNI is a DNS hostname, not an IP address. */
 			return true;
 		}
-		if (X509_VERIFY_PARAM_set1_host(param, hostname, 0) != 1) {
+		// BoringSSL requires the explicit length; OpenSSL also accepts it.
+		if (X509_VERIFY_PARAM_set1_host(param, hostname, strlen(hostname)) != 1) {
 			return false;
 		}
 	}

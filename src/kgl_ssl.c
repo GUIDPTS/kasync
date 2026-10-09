@@ -861,11 +861,12 @@ bool kgl_ssl_ctx_set_cipher_list(SSL_CTX* ctx, const char* cipher) {
 }
 void kgl_ssl_ctx_set_protocols(SSL_CTX* ctx, const char* protocols) {
 #ifdef SSL_CTX_set_min_proto_version
-	SSL_CTX_set_min_proto_version(ctx, 0);
+	SSL_CTX_set_min_proto_version(ctx, TLS1_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
 #endif
 #ifdef TLS1_3_VERSION
-	SSL_CTX_set_min_proto_version(ctx, 0);
+	// BoringSSL interprets zero as TLS 1.2, even for an explicit legacy list.
+	SSL_CTX_set_min_proto_version(ctx, TLS1_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
 #endif
 	if (protocols == NULL || *protocols == '\0') {
