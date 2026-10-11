@@ -385,13 +385,16 @@ static inline kev_result selectable_event_write(kselectable* st, result_callback
 		kassert(st->ssl);
 		KBIT_CLR(st->base.st_flags, STF_WREADY);
 		int err = SSL_get_error(st->ssl->ssl, got);
-		if (errno == EAGAIN || err == SSL_ERROR_WANT_WRITE) {
+		// errno may still contain EAGAIN from an earlier BIO operation.
+		// Only OpenSSL's retry status permits retrying the TLS operation.
+		if (err == SSL_ERROR_WANT_WRITE) {
 #ifdef ENABLE_KSSL_BIO
 			return selectable_ssl_write(st, result, buffer, arg);
 #else
 			return kgl_selector_module.write(st->base.selector, st, result, buffer, arg);
 #endif
 		}
+		return result(st->data, arg, got);
 	}
 #endif
 	if (errno == EAGAIN) {
@@ -439,7 +442,8 @@ kev_result selectable_event_read(kselectable* st, result_callback result, buffer
 		kassert(st->ssl);
 		KBIT_CLR(st->base.st_flags, STF_RREADY);
 		int err = SSL_get_error(st->ssl->ssl, got);
-		if (errno == EAGAIN || err == SSL_ERROR_WANT_READ) {
+		// A terminal TLS error must not retry a failed socket read recursively.
+		if (err == SSL_ERROR_WANT_READ) {
 #ifdef ENABLE_KSSL_BIO
 			return selectable_ssl_read(st, result, buffer, arg);
 #else
